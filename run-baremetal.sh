@@ -89,15 +89,13 @@ start_services() {
 
     # ---- 4. Database Migrations ----
     log "Running database migrations..."
-    # Discovery service migrations
+    # Discovery service migrations (alembic.ini is in backend/)
     (cd discovery-service && \
         DATABASE_URL="postgresql+asyncpg://${DB_USER}:${DB_PASS}@${DB_HOST}/control" \
-        uv run alembic upgrade head 2>&1 | tail -1)
-    # Telemetry migrations
+        uv run alembic -c backend/alembic.ini upgrade head 2>&1 | tail -1)
+    # Telemetry migrations (env.py reads DATABASE_URL, not individual vars)
     (cd telemetry && \
-        TIMESCALEDB_HOST="$DB_HOST" TIMESCALEDB_PORT="$DB_PORT" \
-        TIMESCALEDB_DATABASE=telemetry TIMESCALEDB_USER="$DB_USER" \
-        TIMESCALEDB_PASSWORD="$DB_PASS" \
+        DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/telemetry" \
         uv run alembic upgrade head 2>&1 | tail -1)
     log "Migrations complete"
 
@@ -178,7 +176,7 @@ start_services() {
         TIMESCALEDB_HOST="$DB_HOST" TIMESCALEDB_PORT="$DB_PORT" \
         TIMESCALEDB_DATABASE=telemetry TIMESCALEDB_USER="$DB_USER" \
         TIMESCALEDB_PASSWORD="$DB_PASS" \
-        LOG_LEVEL=INFO PYTHONUNBUFFERED=1 \
+        LOG_LEVEL=INFO PYTHONUNBUFFERED=1 TZ=UTC \
         uv run python -m src.consumer > "$LOGDIR/telemetry-consumer.log" 2>&1 &
         save_pid telemetry_consumer $!)
 
@@ -206,7 +204,7 @@ start_services() {
         PYTHONPATH="$(pwd)/.venv/lib/python3.12/site-packages:$(pwd)" \
         PRODUCER_CONFIG_PATH=config/producer.yaml \
         REDIS_HOST="$REDIS_HOST" REDIS_PORT="$REDIS_PORT" \
-        RAY_ADDRESS="auto" LOG_LEVEL=INFO PYTHONUNBUFFERED=1 \
+        RAY_ADDRESS="auto" LOG_LEVEL=INFO PYTHONUNBUFFERED=1 TZ=UTC \
         /usr/bin/python3.12 -c "
 import os, sys, logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -235,7 +233,7 @@ keep_alive()
         REGISTER_MAP_FILE="register_map.yaml" \
         TELEMETRY_ENABLED="true" TELEMETRY_NAMESPACE="telemetry" \
         TELEMETRY_ACTOR_NAME="telemetry_actor" \
-        LOKI_ENABLED="false" PYTHONUNBUFFERED=1 \
+        LOKI_ENABLED="false" PYTHONUNBUFFERED=1 TZ=UTC \
         .venv/bin/python -c "
 import os, sys, signal, time
 os.environ.pop('RAY_ADDRESS', None)
@@ -279,15 +277,22 @@ stop_services() {
     log "Stopping DFC services..."
 
     if [ -f "$PIDFILE" ]; then
+        # Deduplicate PIDs (keep last entry per name)
+        declare -A seen_pids
         while IFS='=' read -r name pid; do
+            seen_pids["$name"]="$pid"
+        done < "$PIDFILE"
+
+        for name in "${!seen_pids[@]}"; do
+            pid="${seen_pids[$name]}"
             if kill -0 "$pid" 2>/dev/null; then
                 kill "$pid" 2>/dev/null && log "Stopped $name (PID $pid)" || true
             fi
-        done < "$PIDFILE"
+        done
         rm -f "$PIDFILE"
     fi
 
-    # Stop Ray (but not the head if user wants to keep it)
+    # Stop Ray
     ray stop 2>/dev/null || true
     log "Ray stopped"
 
@@ -345,17 +350,29 @@ ray.shutdown()
 
     echo ""
 
-    # Process status
+    # Process status (deduplicated — shows only latest PID per service)
     if [ -f "$PIDFILE" ]; then
         echo "Background processes:"
+        declare -A seen_pids
         while IFS='=' read -r name pid; do
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "  $name (PID $pid): running"
-            else
-                echo "  $name (PID $pid): stopped"
-            fi
+            seen_pids["$name"]="$pid"
         done < "$PIDFILE"
+        for name in breakers miners1 miners2 modbus discovery telemetry_consumer control telemetry_producer grid_gateway; do
+            pid="${seen_pids[$name]:-}"
+            if [ -n "$pid" ]; then
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "  $name (PID $pid): running"
+                else
+                    echo "  $name (PID $pid): stopped"
+                fi
+            fi
+        done
     fi
+
+    # Redis stream info
+    echo ""
+    STREAM_LEN=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" XLEN events 2>/dev/null || echo "N/A")
+    echo "Redis stream 'events': $STREAM_LEN messages"
 }
 
 case "${1:-}" in
