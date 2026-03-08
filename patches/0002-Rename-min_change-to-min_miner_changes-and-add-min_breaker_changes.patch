@@ -1,0 +1,186 @@
+diff --git a/src/actors/fleet.py b/src/actors/fleet.py
+index 55e550d..9baf654 100644
+--- a/src/actors/fleet.py
++++ b/src/actors/fleet.py
+@@ -28,6 +28,7 @@ class PowerDistributionStrategy(Enum):
+ 
+     BALANCED = 'equal'  # equal while respecting capacity limits
+     CAPACITY_BASED = 'capacity_based'  # Distribute based on current capacity utilization
++    MIN_BREAKER_CHANGES = 'min_breaker_changes'  # Minimize the number of breakers whose allocations change
+ 
+ 
+ @dataclass
+@@ -301,6 +302,8 @@ class FleetStatus:
+             allocations = self._calculate_balanced_distribution(total_power, supervisor_max_powers)
+         elif strategy == PowerDistributionStrategy.CAPACITY_BASED:
+             allocations = self._calculate_capacity_based_distribution(total_power, supervisor_max_powers)
++        elif strategy == PowerDistributionStrategy.MIN_BREAKER_CHANGES:
++            allocations = self._calculate_min_breaker_changes_distribution(total_power, supervisor_max_powers)
+         else:
+             # Fail gracefully - log warning and fall back to capacity based distribution
+             # Default to capacity based as it is safer/better default than "balanced" (which is actually equal distribution)
+@@ -413,6 +416,90 @@ class FleetStatus:
+ 
+         return allocations
+ 
++    def _calculate_min_breaker_changes_distribution(
++        self, total_power: int, supervisor_max_powers: dict[str, int]
++    ) -> dict[str, int]:
++        """
++        Distribute power across supervisors while minimizing the number of breakers whose
++        allocations change from their current setpoints.
++
++        Strategy:
++        - Start from current allocations and apply the delta to the fewest supervisors.
++        - For increases: fill supervisors with most headroom first.
++        - For decreases: try single-supervisor reduction first, then zero out smallest and reduce next.
++        """
++        if not supervisor_max_powers:
++            return {}
++
++        current = dict(self.supervisor_allocations)
++        # Ensure all supervisors are represented
++        for sid in supervisor_max_powers:
++            current.setdefault(sid, 0)
++
++        current_total = sum(current[sid] for sid in supervisor_max_powers)
++        delta = total_power - current_total
++
++        if delta == 0:
++            return {sid: current[sid] for sid in supervisor_max_powers}
++
++        targets = {sid: current[sid] for sid in supervisor_max_powers}
++
++        if delta > 0:
++            remaining = delta
++            # Sort by headroom descending — fill biggest-headroom supervisors first
++            by_headroom = sorted(
++                supervisor_max_powers.keys(),
++                key=lambda sid: supervisor_max_powers[sid] - targets[sid],
++                reverse=True,
++            )
++            for sid in by_headroom:
++                if remaining <= 0:
++                    break
++                headroom = supervisor_max_powers[sid] - targets[sid]
++                if headroom <= 0:
++                    continue
++                add = min(headroom, remaining)
++                targets[sid] += add
++                remaining -= add
++        else:
++            remaining = -delta  # positive amount to shed
++
++            # First pass: check if a single supervisor can absorb the entire decrease
++            supervisor_min_powers = self.supervisor_min_powers
++            active = [
++                sid for sid in supervisor_max_powers if targets[sid] > 0
++            ]
++            for sid in sorted(active, key=lambda s: targets[s] - supervisor_min_powers.get(s, 0), reverse=True):
++                reducible = targets[sid] - supervisor_min_powers.get(sid, 0)
++                if reducible >= remaining:
++                    targets[sid] -= remaining
++                    remaining = 0
++                    break
++
++            if remaining > 0:
++                # Second pass: zero out smallest supervisors first, then reduce the next
++                active = [sid for sid in supervisor_max_powers if targets[sid] > 0]
++                active.sort(key=lambda sid: targets[sid])
++
++                for sid in active:
++                    if remaining <= 0:
++                        break
++                    min_power = supervisor_min_powers.get(sid, 0)
++                    reducible = targets[sid] - min_power
++                    sleepable = targets[sid]
++
++                    if remaining >= sleepable:
++                        targets[sid] = 0
++                        remaining -= sleepable
++                    elif remaining <= reducible:
++                        targets[sid] -= remaining
++                        remaining = 0
++                    else:
++                        targets[sid] = 0
++                        remaining -= sleepable
++
++        return targets
++
+     def calculate_surplus_power_redistribution(self, source_supervisor_id: str, surplus_power: int) -> dict[str, int]:
+         """
+         Calculate how to redistribute surplus power from one supervisor to others.
+diff --git a/src/actors/supervisor.py b/src/actors/supervisor.py
+index 4792f56..886a987 100644
+--- a/src/actors/supervisor.py
++++ b/src/actors/supervisor.py
+@@ -2082,7 +2082,7 @@ class SupervisorActor:
+ 
+         # Calculate target power for each miner using configured strategy
+         strategy = self.config.miner_power_strategy
+-        if strategy == 'min_change':
++        if strategy == 'min_miner_changes':
+             miner_targets = status.calculate_min_change_targets(total_power)
+         else:
+             miner_targets = status.calculate_miner_power_targets(total_power)
+diff --git a/src/core/config/models.py b/src/core/config/models.py
+index 91c5245..40476ae 100644
+--- a/src/core/config/models.py
++++ b/src/core/config/models.py
+@@ -87,10 +87,10 @@ class SupervisorConfig(BaseModel):
+     )
+ 
+     # Power distribution settings
+-    miner_power_strategy: Literal['proportional', 'min_change'] = Field(
++    miner_power_strategy: Literal['proportional', 'min_miner_changes'] = Field(
+         default='proportional',
+         description="Miner power allocation strategy: 'proportional' recalculates all targets from scratch, "
+-        "'min_change' minimizes the number of miners whose setpoints change",
++        "'min_miner_changes' minimizes the number of miners whose setpoints change",
+     )
+     default_step_size: int = Field(default=500, ge=1, description='Default power step size in watts')
+     default_step_sleep: int = Field(default=2, ge=0, description='Sleep time between power steps in seconds')
+@@ -140,7 +140,7 @@ class FleetConfig(BaseModel):
+     """Configuration for fleet management settings."""
+ 
+     # Power management
+-    power_distribution_strategy: Literal['equal', 'capacity_based'] = Field(
++    power_distribution_strategy: Literal['equal', 'capacity_based', 'min_breaker_changes'] = Field(
+         default='capacity_based', description='Power distribution strategy'
+     )
+     global_power_limit: int = Field(default=1000000, ge=0, description='Global fleet power limit in watts')
+diff --git a/src/core/settings.py b/src/core/settings.py
+index 5110003..d90fc6c 100644
+--- a/src/core/settings.py
++++ b/src/core/settings.py
+@@ -97,7 +97,7 @@ class FleetSettings(BaseSettings):
+     # Power management
+     power_distribution_strategy: str = Field(
+         default='capacity_based',
+-        description="Power distribution strategy: 'equal' or 'capacity_based'",
++        description="Power distribution strategy: 'equal', 'capacity_based', or 'min_breaker_changes'",
+     )
+     global_power_limit: int = Field(
+         default=300000,
+diff --git a/tests/test_min_change_strategy.py b/tests/test_min_change_strategy.py
+index b32c404..2809c21 100644
+--- a/tests/test_min_change_strategy.py
++++ b/tests/test_min_change_strategy.py
+@@ -400,7 +400,7 @@ def min_change_config():
+         supervisor_id='sup_min_change',
+         modbus_ip='192.168.1.100',
+         max_total_power=50000,
+-        miner_power_strategy='min_change',
++        miner_power_strategy='min_miner_changes',
+         miners=[
+             MinerConfig(device_id='m1', ip='10.0.0.1', phase='A', min_power=1000, max_power=5000),
+             MinerConfig(device_id='m2', ip='10.0.0.2', phase='B', min_power=1000, max_power=5000),
+@@ -416,7 +416,7 @@ def min_change_config_multi():
+         supervisor_id='sup_min_change_multi',
+         modbus_ip='192.168.1.100',
+         max_total_power=60000,
+-        miner_power_strategy='min_change',
++        miner_power_strategy='min_miner_changes',
+         miners=[
+             MinerConfig(device_id='m1', ip='10.0.0.1', phase='A', min_power=1000, max_power=5000),
+             MinerConfig(device_id='m4', ip='10.0.0.4', phase='A', min_power=1000, max_power=5000),
