@@ -1,0 +1,396 @@
+# DFC Stack - Unified Docker Compose
+# All services on a single bridge network (no macvlan required)
+#
+# Usage:
+#   docker compose up --build -d
+#   docker compose logs -f
+#   docker compose down -v
+
+services:
+  # ============================================================
+  # Infrastructure
+  # ============================================================
+  postgres:
+    image: timescale/timescaledb:2.24.0-pg17
+    hostname: postgres
+    environment:
+      - POSTGRES_DB=control
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - TIMESCALEDB_TELEMETRY=off
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=128MB
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d control"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.2
+
+  telemetry-redis:
+    image: redis:latest
+    hostname: telemetry-redis
+    expose:
+      - 6379
+    volumes:
+      - telemetry_redis_data:/data
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.3
+
+  ray-head:
+    image: rayproject/ray:2.49.2-py312-cpu
+    hostname: ray-head
+    command: >
+      ray start --head --port=6380
+      --dashboard-host=0.0.0.0 --dashboard-port=8265
+      --num-cpus=8 --block
+    ports:
+      - "8265:8265"
+      - "6380:6380"
+      - "10001:10001"
+    shm_size: 2gb
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.4
+
+  # ============================================================
+  # Database Migrations & Seeding
+  # ============================================================
+  migrator:
+    build:
+      context: /dfc/discovery-service
+    command: >
+      sh -c "uv run alembic -c backend/alembic.ini upgrade head &&
+             uv run python backend/scripts/seed_virtual_fleet.py backend/scripts/fleet-manifest.json"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres/control
+    restart: "no"
+    networks:
+      - dfc
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  telemetry-migrations:
+    build:
+      context: /dfc/telemetry
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/telemetry
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dfc
+    volumes:
+      - /dfc/telemetry/alembic:/app/alembic:ro
+    command: >
+      sh -c "
+        PGPASSWORD=postgres psql -h postgres -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname='telemetry'\" | grep -q 1 ||
+        PGPASSWORD=postgres psql -h postgres -U postgres -c 'CREATE DATABASE telemetry';
+        PGPASSWORD=postgres psql -h postgres -U postgres -d telemetry -c 'CREATE EXTENSION IF NOT EXISTS timescaledb' 2>/dev/null || true;
+        uv run --no-sync alembic upgrade head
+      "
+    restart: "no"
+
+  # ============================================================
+  # Virtual Grid Devices
+  # ============================================================
+  breaker-fleet:
+    build: /dfc/virtual-grid-devices/virtual_breaker
+    hostname: breaker-fleet
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BREAKER_IPS=192.168.100.100,192.168.100.101
+      - HOSTNAME_PREFIX=breaker
+      - BREAKER_VOLTAGE=230
+      - BREAKER_FREQUENCY=50
+      - MINER_TIMEOUT=5.0
+      - NETWORK_INTERFACE=eth0
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.100
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://192.168.100.100:8000/status')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  miner-fleet-1:
+    build: /dfc/virtual-grid-devices/virtual_miner
+    hostname: miner-fleet-1
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MINER_IPS=192.168.100.10,192.168.100.11,192.168.100.12,192.168.100.13,192.168.100.14,192.168.100.15,192.168.100.16,192.168.100.17,192.168.100.18,192.168.100.19
+      - HOSTNAME_PREFIX=miner-1
+      - MINER_POWER=3200
+      - PHASE_DISTRIBUTION=4,3,3
+      - BREAKER_URL=http://192.168.100.100:8000
+      - POWER_PUSH_INTERVAL=1.0
+      - MINER_RAMP_UP_SECONDS=16
+      - MINER_RAMP_DOWN_SECONDS=25
+      - NETWORK_INTERFACE=eth0
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.10
+    depends_on:
+      breaker-fleet:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://192.168.100.10:8080/status')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  miner-fleet-2:
+    build: /dfc/virtual-grid-devices/virtual_miner
+    hostname: miner-fleet-2
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MINER_IPS=192.168.100.20,192.168.100.21,192.168.100.22,192.168.100.23,192.168.100.24,192.168.100.25,192.168.100.26,192.168.100.27,192.168.100.28,192.168.100.29
+      - HOSTNAME_PREFIX=miner-2
+      - MINER_POWER=3200
+      - PHASE_DISTRIBUTION=4,3,3
+      - BREAKER_URL=http://192.168.100.101:8000
+      - POWER_PUSH_INTERVAL=1.0
+      - MINER_RAMP_UP_SECONDS=16
+      - MINER_RAMP_DOWN_SECONDS=25
+      - NETWORK_INTERFACE=eth0
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.20
+    depends_on:
+      breaker-fleet:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://192.168.100.20:8080/status')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ============================================================
+  # Application Services
+  # ============================================================
+  modbus-server:
+    build: /dfc/modbus-server
+    hostname: modbus-server
+    ports:
+      - "502:502"
+      - "503:503"
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - MODBUS_HOST=0.0.0.0
+      - MODBUS_PORT=502
+      - FASTAPI_PORT_OFFSET=1
+      - HEARTBEAT_ENABLED=true
+      - HEARTBEAT_INTERVAL=0.2
+    volumes:
+      - /dfc/modbus-server/config:/app/config:ro
+    command: python -m src.entry.fastapi_entry
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:503/status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  discovery-service:
+    build: /dfc/discovery-service
+    hostname: discovery-service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres/control
+      - RAY_ADDRESS=ray://ray-head:10001
+    command: uv run uvicorn backend.main:app --host 0.0.0.0 --port 8001
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.6
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  control-service:
+    build: /dfc/control-service
+    hostname: control-service
+    shm_size: 2gb
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/control
+      - RAY_HEAD_ADDRESS=ray-head
+      - RAY_HEAD_PORT=6380
+      - RAY_NAMESPACE=control_service
+      - RAY_raylet_heartbeat_timeout_milliseconds=60000
+      - RAY_memory_usage_threshold=0.99
+      - ENABLE_POWER_SETPOINT=false
+      - FLEET_POWER_DISTRIBUTION_STRATEGY=capacity_based
+      - FLEET_GLOBAL_POWER_LIMIT=300000
+      - FLEET_MONITOR_INTERVAL=5
+      - FLEET_SET_MINERS_TO_SLEEP_ON_STARTUP=true
+      - TELEMETRY_ENABLED=true
+      - TELEMETRY_ACTOR_NAME=telemetry_actor
+      - TELEMETRY_NAMESPACE=telemetry
+      - LOKI_ENABLED=false
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - BREAKER_SMOOTHING_WINDOW=1
+    command: ["python", "-m", "src.main"]
+    restart: unless-stopped
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      ray-head:
+        condition: service_healthy
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.7
+
+  grid-gateway:
+    build: /dfc/grid-gateway
+    hostname: grid-gateway
+    shm_size: 2gb
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RAY_gcs_rpc_server_reconnect_timeout_s=7200
+      - RAY_memory_usage_threshold=0.99
+      - RAY_ADDRESS=ray-head:6380
+      - CONTROLLER_NAMESPACE=control_service
+      - CONTROLLER_NAME=fleet_controller
+      - MODBUS_URL=http://modbus-server:503
+      - MODBUS_LOOP_INTERVAL=0.2
+      - REGISTER_MAP_FILE=register_map.yaml
+      - TELEMETRY_ENABLED=true
+      - TELEMETRY_NAMESPACE=telemetry
+      - TELEMETRY_ACTOR_NAME=telemetry_actor
+      - LOKI_ENABLED=false
+    restart: unless-stopped
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      modbus-server:
+        condition: service_started
+      control-service:
+        condition: service_started
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.8
+
+  # ============================================================
+  # Telemetry
+  # ============================================================
+  telemetry-producer:
+    build:
+      context: /dfc/telemetry
+      dockerfile: Dockerfile.producer
+    hostname: telemetry-producer
+    shm_size: 2gb
+    volumes:
+      - /dfc/telemetry/config:/app/config:ro
+    environment:
+      - PRODUCER_CONFIG_PATH=/app/config/producer.yaml
+      - RAY_ADDRESS=ray-head:6380
+      - RAY_memory_usage_threshold=0.99
+      - REDIS_HOST=telemetry-redis
+      - REDIS_PORT=6379
+      - RAY_NAMESPACE=telemetry
+      - LOG_LEVEL=INFO
+    depends_on:
+      telemetry-redis:
+        condition: service_healthy
+      telemetry-migrations:
+        condition: service_completed_successfully
+      ray-head:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.40
+
+  telemetry-consumer:
+    build:
+      context: /dfc/telemetry
+      dockerfile: Dockerfile
+    hostname: telemetry-consumer
+    volumes:
+      - /dfc/telemetry/config:/app/config:ro
+    environment:
+      - CONSUMER_CONFIG_PATH=/app/config/consumer.yaml
+      - REDIS_HOST=telemetry-redis
+      - REDIS_PORT=6379
+      - TIMESCALEDB_HOST=postgres
+      - TIMESCALEDB_PORT=5432
+      - TIMESCALEDB_DATABASE=telemetry
+      - TIMESCALEDB_USER=postgres
+      - TIMESCALEDB_PASSWORD=postgres
+      - LOG_LEVEL=INFO
+    depends_on:
+      telemetry-redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      telemetry-migrations:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      dfc:
+        ipv4_address: 192.168.100.41
+
+volumes:
+  postgres_data:
+  telemetry_redis_data:
+
+networks:
+  dfc:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+          gateway: 192.168.100.1
