@@ -2,13 +2,14 @@
 # Bare-metal launcher for the DFC (Distributed Fleet Controller) stack
 # Runs the entire Docker Compose stack natively without Docker
 #
-# Prerequisites:
+# Prerequisites (installed by setup.sh):
 #   - PostgreSQL 16 with TimescaleDB extension
 #   - Redis server
 #   - Ray (pip install "ray[default]==2.49.2")
 #   - uv (Python package manager)
+#   - Python 3.12 + 3.13
 #   - iproute2, arping (for virtual device networking)
-#   - All repos cloned via setup.sh
+#   - All repos cloned and dependencies installed via setup.sh
 #
 # Usage:
 #   ./run-baremetal.sh start    # Start all services
