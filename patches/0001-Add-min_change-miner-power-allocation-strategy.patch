@@ -1,0 +1,893 @@
+From e8babbe4dd3893c645a1b3905d6b231a04e1dc91 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Mar 2026 14:24:37 +0000
+Subject: [PATCH] Add min_change miner power allocation strategy
+
+New strategy that minimizes the number of miner setpoint changes when
+adjusting total power. Instead of recalculating all targets from scratch
+(proportional), it applies the delta to the fewest miners possible:
+
+- For increases: fills active miners with most headroom first, wakes
+  sleeping miners only if needed
+- For decreases: tries single-miner reduction first, then sleeps
+  smallest miners and reduces next
+- Maintains phase balance (equal split across A/B/C)
+- Skips unchanged miners entirely (no API call sent)
+
+Config: SupervisorConfig.miner_power_strategy = 'min_change' | 'proportional'
+Default remains 'proportional' for backward compatibility.
+
+28 new tests (22 unit + 6 Ray integration), zero regressions.
+
+https://claude.ai/code/session_01H6YkrU2kDQgqbZoE2WHB1Y
+---
+ src/actors/supervisor.py          | 186 ++++++++-
+ src/core/config/models.py         |   5 +
+ tests/test_min_change_strategy.py | 620 ++++++++++++++++++++++++++++++
+ 3 files changed, 803 insertions(+), 8 deletions(-)
+ create mode 100644 tests/test_min_change_strategy.py
+
+diff --git a/src/actors/supervisor.py b/src/actors/supervisor.py
+index 0bf4206..4792f56 100644
+--- a/src/actors/supervisor.py
++++ b/src/actors/supervisor.py
+@@ -539,6 +539,162 @@ class SupervisorStatus:
+ 
+         return miner_targets
+ 
++    def calculate_min_change_targets(self, total_power: int) -> dict[str, int]:
++        """
++        Calculate target power for each miner while minimizing the number of setpoint changes.
++
++        Instead of recalculating all targets from scratch (like calculate_miner_power_targets),
++        this method looks at current miner setpoints and applies the power delta to the
++        fewest miners possible.
++
++        Args:
++            total_power: Total power to distribute (must be within valid range)
++
++        Returns:
++            Dictionary of miner targets that maintain phase balance
++        """
++        if total_power == 0:
++            return dict.fromkeys(self.miner_actors.keys(), 0)
++
++        # Equal allocation across phases (same as proportional)
++        base_power = total_power // 3
++        remaining = total_power % 3
++        phase_allocations = {
++            'A': base_power + (1 if remaining > 0 else 0),
++            'B': base_power + (1 if remaining > 1 else 0),
++            'C': base_power,
++        }
++
++        miner_targets = {}
++        for phase, miners in self.get_phase_miners().items():
++            target_phase_power = phase_allocations[phase]
++
++            if not miners:
++                continue
++
++            # Get current setpoints
++            current = {ip: actor.miner_status.power_setpoint for ip, actor in miners}
++            current_total = sum(current.values())
++            delta = target_phase_power - current_total
++
++            if delta == 0:
++                # No change needed for this phase
++                for ip, _ in miners:
++                    miner_targets[ip] = current[ip]
++            elif delta > 0:
++                miner_targets.update(
++                    self._min_change_increase(miners, current, delta)
++                )
++            else:
++                miner_targets.update(
++                    self._min_change_decrease(miners, current, -delta)
++                )
++
++        return miner_targets
++
++    def _min_change_increase(
++        self,
++        miners: list[tuple[str, 'MinerActor']],
++        current: dict[str, int],
++        delta: int,
++    ) -> dict[str, int]:
++        """
++        Increase phase power by delta, changing the fewest miners possible.
++
++        Strategy: pick miners with most headroom first, max them out one by one.
++        Sleeping miners (power=0) are woken last since wake-up is the most expensive change.
++        """
++        targets = dict(current)  # Start with current setpoints
++        remaining = delta
++
++        # Split into active miners (have headroom) and sleeping miners
++        active_with_headroom = []
++        sleeping = []
++        for ip, actor in miners:
++            if current[ip] > 0:
++                headroom = actor.max_power - current[ip]
++                if headroom > 0:
++                    active_with_headroom.append((ip, actor, headroom))
++            else:
++                sleeping.append((ip, actor))
++
++        # First: increase active miners (sorted by headroom descending — fewer miners touched)
++        active_with_headroom.sort(key=lambda x: x[2], reverse=True)
++        for ip, actor, headroom in active_with_headroom:
++            if remaining <= 0:
++                break
++            add = min(headroom, remaining)
++            targets[ip] = current[ip] + add
++            remaining -= add
++
++        # Second: wake sleeping miners if still needed (sorted by max_power descending)
++        sleeping.sort(key=lambda x: x[1].max_power, reverse=True)
++        for ip, actor in sleeping:
++            if remaining <= 0:
++                break
++            # Must provide at least min_power when waking
++            power = min(actor.max_power, actor.min_power + remaining)
++            # But we need at least min_power worth of delta to wake this miner
++            if remaining >= actor.min_power:
++                power = min(actor.max_power, remaining)
++                targets[ip] = max(actor.min_power, power)
++                remaining -= targets[ip]
++            # else: not enough delta to wake this miner, skip
++
++        return targets
++
++    def _min_change_decrease(
++        self,
++        miners: list[tuple[str, 'MinerActor']],
++        current: dict[str, int],
++        delta: int,
++    ) -> dict[str, int]:
++        """
++        Decrease phase power by delta, changing the fewest miners possible.
++
++        Strategy:
++        1. First try to absorb the delta by reducing a single miner (most to least power).
++        2. If no single miner can absorb it, sleep the smallest miners and reduce the next.
++        """
++        targets = dict(current)
++        remaining = delta
++
++        # Only consider active miners (those with power > 0)
++        active = [(ip, actor) for ip, actor in miners if current[ip] > 0]
++
++        # First pass: check if a single miner can absorb the entire delta (fewest changes = 1)
++        # Sort by reducible headroom descending to find the best single candidate
++        for ip, actor in sorted(active, key=lambda x: current[x[0]] - x[1].min_power, reverse=True):
++            reducible = current[ip] - actor.min_power
++            if reducible >= remaining:
++                targets[ip] = current[ip] - remaining
++                return targets
++
++        # Second pass: need multiple changes. Sleep smallest miners first, then reduce the next.
++        active.sort(key=lambda x: current[x[0]])
++
++        for ip, actor in active:
++            if remaining <= 0:
++                break
++
++            reducible = current[ip] - actor.min_power
++            sleepable = current[ip]
++
++            if remaining >= sleepable:
++                targets[ip] = 0
++                remaining -= sleepable
++            elif remaining <= reducible:
++                targets[ip] = current[ip] - remaining
++                remaining = 0
++            else:
++                # Can't fully absorb delta, reduce to min_power and continue
++                targets[ip] = actor.min_power
++                remaining -= reducible
++                targets[ip] = 0
++                remaining -= sleepable
++
++        return targets
++
+     def calculate_phase_power_redistribution(
+         self, phase: str, surplus_power: int, exclude_miner_ip: str | None = None
+     ) -> dict[str, int]:
+@@ -1924,29 +2080,43 @@ class SupervisorActor:
+             )
+             return {}
+ 
+-        # Calculate target power for each miner using configured phase balance threshold
+-        miner_targets = status.calculate_miner_power_targets(total_power)
+-        logger.info('Miner targets calculated', extra={'miner_targets': miner_targets})
++        # Calculate target power for each miner using configured strategy
++        strategy = self.config.miner_power_strategy
++        if strategy == 'min_change':
++            miner_targets = status.calculate_min_change_targets(total_power)
++        else:
++            miner_targets = status.calculate_miner_power_targets(total_power)
++        logger.info('Miner targets calculated', extra={'miner_targets': miner_targets, 'strategy': strategy})
+ 
+         if not miner_targets:
+             logger.warning('No miners available for power distribution')
+             return {}
+ 
+-        # Create tasks for all miners
+-        tasks = list(starmap(self.set_miner_power_setpoint, miner_targets.items()))
++        # Filter out miners whose setpoint is unchanged (optimization for min_change strategy)
++        changed_targets = {
++            ip: power for ip, power in miner_targets.items()
++            if ip not in self.miner_actors
++            or self.miner_actors[ip].miner_status.power_setpoint != power
++        }
++
++        # Create tasks only for miners that need changes
++        tasks = list(starmap(self.set_miner_power_setpoint, changed_targets.items()))
+ 
+         # Execute all power changes concurrently
+         task_results = await asyncio.gather(*tasks, return_exceptions=True)
+ 
+-        # Convert results to dict
+-        results = dict(zip(miner_targets.keys(), task_results, strict=False))
++        # Build results: unchanged miners are automatically successful
++        results = {ip: True for ip in miner_targets}
++        for ip, result in zip(changed_targets.keys(), task_results, strict=False):
++            results[ip] = result if isinstance(result, bool) else False
+ 
+         logger.info(
+             'Group power distribution completed',
+             extra={
+                 'total_power': total_power,
+-                'strategy': 'proportional_with_phases',
++                'strategy': strategy,
+                 'total_miners': status.total_miners,
++                'miners_changed': len(changed_targets),
+                 'successful_miners': sum(1 for success in results.values() if success),
+                 'max_phase_imbalance': status.max_phase_imbalance,
+                 'phase_details': status.get_phase_details(),
+diff --git a/src/core/config/models.py b/src/core/config/models.py
+index 1f74c29..91c5245 100644
+--- a/src/core/config/models.py
++++ b/src/core/config/models.py
+@@ -87,6 +87,11 @@ class SupervisorConfig(BaseModel):
+     )
+ 
+     # Power distribution settings
++    miner_power_strategy: Literal['proportional', 'min_change'] = Field(
++        default='proportional',
++        description="Miner power allocation strategy: 'proportional' recalculates all targets from scratch, "
++        "'min_change' minimizes the number of miners whose setpoints change",
++    )
+     default_step_size: int = Field(default=500, ge=1, description='Default power step size in watts')
+     default_step_sleep: int = Field(default=2, ge=0, description='Sleep time between power steps in seconds')
+ 
+diff --git a/tests/test_min_change_strategy.py b/tests/test_min_change_strategy.py
+new file mode 100644
+index 0000000..b32c404
+--- /dev/null
++++ b/tests/test_min_change_strategy.py
+@@ -0,0 +1,620 @@
++"""Tests for the min_change miner power allocation strategy.
++
++The min_change strategy minimizes the number of miners whose setpoints change
++when adjusting total power, as opposed to the proportional strategy which
++recalculates all targets from scratch every time.
++"""
++
++import asyncio
++
++import pytest
++import ray
++
++from src.actors.supervisor import SupervisorActor, SupervisorStatus
++from src.core.config.models import MinerConfig, SupervisorConfig
++from tests.mocks import MockMinerActor
++
++
++# ============================================================
++# Helpers
++# ============================================================
++
++def make_mock_miner(ip: str, phase: str, power: int, min_power: int = 1000, max_power: int = 5000):
++    """Create a MockMinerActor with the given current power setpoint."""
++    cfg = MinerConfig(device_id=ip, ip=ip, phase=phase, min_power=min_power, max_power=max_power)
++    mock = MockMinerActor(cfg, supervisor=None, telemetry_ref=None)
++    mock.miner_status.power_setpoint_variable = power
++    mock.miner_status.actual_wattage = power
++    mock.miner_status.is_sleeping = power == 0
++    return mock
++
++
++def build_status(miners: dict[str, MockMinerActor]) -> SupervisorStatus:
++    """Build a SupervisorStatus from a dict of mock miners."""
++    return SupervisorStatus(miners, phase_balance_threshold=0.15, phase_balance_min_power_threshold=100)
++
++
++# ============================================================
++# Unit tests for calculate_min_change_targets (no Ray needed)
++# ============================================================
++
++class TestMinChangeNoOp:
++    """When total power is unchanged, no miners should change."""
++
++    def test_same_total_power_no_changes(self):
++        """If requested total equals current total, all miners keep their setpoints."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(9000)
++
++        assert targets == {'10.0.0.1': 3000, '10.0.0.2': 3000, '10.0.0.3': 3000}
++
++    def test_zero_to_zero(self):
++        """All sleeping miners stay at 0 when target is 0."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 0),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 0),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 0),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(0)
++
++        assert all(v == 0 for v in targets.values())
++
++
++class TestMinChangeIncrease:
++    """Tests for increasing total power with minimum miner changes."""
++
++    def test_small_increase_changes_one_miner(self):
++        """A small power increase should only change one miner per phase that needs it."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        # Increase by 300W (100W per phase)
++        targets = status.calculate_min_change_targets(9300)
++
++        # Each phase has exactly 1 miner, so each changes by 100W
++        assert targets['10.0.0.1'] == 3100
++        assert targets['10.0.0.2'] == 3100
++        assert targets['10.0.0.3'] == 3100
++        assert sum(targets.values()) == 9300
++
++    def test_increase_uses_fewest_miners(self):
++        """With multiple miners per phase, only the ones with most headroom should change."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000, max_power=5000),  # 2000 headroom
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 3000, max_power=5000),  # 2000 headroom
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, max_power=5000),  # 2000 headroom
++            '10.0.0.5': make_mock_miner('10.0.0.5', 'B', 3000, max_power=5000),  # 2000 headroom
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, max_power=5000),
++            '10.0.0.6': make_mock_miner('10.0.0.6', 'C', 3000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current total: 18000 (6000/phase)
++        # Request: 19500 → 6500/phase, +500/phase
++        # Each phase has 2 miners at 3000 with 2000 headroom each.
++        # Only ONE miner per phase should change (absorbs the 500W delta).
++        targets = status.calculate_min_change_targets(19500)
++        assert sum(targets.values()) == 19500
++
++        # Per phase, only 1 miner should change
++        for phase_ips in [('10.0.0.1', '10.0.0.4'), ('10.0.0.2', '10.0.0.5'), ('10.0.0.3', '10.0.0.6')]:
++            changed = sum(1 for ip in phase_ips if targets[ip] != 3000)
++            assert changed == 1, f'Expected 1 change, got {changed}: {[(ip, targets[ip]) for ip in phase_ips]}'
++
++    def test_increase_from_zero_wakes_miners(self):
++        """Increasing from 0 should wake the minimum number of miners."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 0, min_power=1000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 0, min_power=1000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 0, min_power=1000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Request 3000W (1000 per phase) — exactly min_power for each
++        targets = status.calculate_min_change_targets(3000)
++
++        assert sum(targets.values()) == 3000
++        # Each phase needs 1000W, each miner's min_power is 1000, so each wakes at 1000
++        assert targets['10.0.0.1'] == 1000
++        assert targets['10.0.0.2'] == 1000
++        assert targets['10.0.0.3'] == 1000
++
++    def test_increase_prefers_active_over_sleeping(self):
++        """Active miners with headroom should be increased before waking sleeping miners."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 0, min_power=1000, max_power=5000),  # sleeping
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current: A=3000, B=3000, C=3000 = 9000
++        # Request 10500 → 3500/phase
++        # Phase A current: 3000, target: 3500 → +500. Active miner has 2000 headroom.
++        # Should increase 10.0.0.1 by 500, NOT wake 10.0.0.4
++        targets = status.calculate_min_change_targets(10500)
++
++        assert targets['10.0.0.1'] == 3500
++        assert targets['10.0.0.4'] == 0  # stays sleeping
++        assert targets['10.0.0.2'] == 3500
++        assert targets['10.0.0.3'] == 3500
++        assert sum(targets.values()) == 10500
++
++    def test_increase_beyond_active_headroom_wakes_sleeper(self):
++        """If active miners can't absorb the increase, sleeping miners should wake."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 4500, max_power=5000),  # 500 headroom
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 0, min_power=1000, max_power=5000),  # sleeping
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 4500, max_power=5000),
++            '10.0.0.5': make_mock_miner('10.0.0.5', 'B', 0, min_power=1000, max_power=5000),  # sleeping
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 4500, max_power=5000),
++            '10.0.0.6': make_mock_miner('10.0.0.6', 'C', 0, min_power=1000, max_power=5000),  # sleeping
++        }
++        status = build_status(miners)
++        # Current: A=4500, B=4500, C=4500 = 13500
++        # Request 18000 → 6000/phase
++        # Phase A: need 6000, active at 4500 has 500 headroom → 5000, need 1000 more → wake sleeper at 1000
++        # Phase B: same
++        # Phase C: same
++        targets = status.calculate_min_change_targets(18000)
++
++        assert targets['10.0.0.1'] == 5000  # maxed out
++        assert targets['10.0.0.4'] >= 1000  # woken, at least min_power
++        phase_a_total = targets['10.0.0.1'] + targets['10.0.0.4']
++        assert phase_a_total == 6000
++        assert sum(targets.values()) == 18000
++
++
++class TestMinChangeDecrease:
++    """Tests for decreasing total power with minimum miner changes."""
++
++    def test_small_decrease_changes_one_miner_per_phase(self):
++        """A small decrease should only reduce one miner per affected phase."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        # Decrease by 300W (100W per phase)
++        targets = status.calculate_min_change_targets(8700)
++
++        assert targets['10.0.0.1'] == 2900
++        assert targets['10.0.0.2'] == 2900
++        assert targets['10.0.0.3'] == 2900
++        assert sum(targets.values()) == 8700
++
++    def test_large_decrease_sleeps_miners(self):
++        """A large decrease should sleep some miners rather than spread thin."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 2000, min_power=1000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 3000, min_power=1000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, min_power=1000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, min_power=1000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current: A=5000, B=3000, C=3000 = 11000
++        # Request 6000 → 2000/phase
++        # Phase A: current 5000, target 2000 → need to shed 3000
++        #   Sleep 10.0.0.1 (2000W) → shed 2000, then reduce 10.0.0.4 by 1000 → 2000
++        # Phase B: 3000 → 2000, reduce by 1000
++        # Phase C: 3000 → 2000, reduce by 1000
++        targets = status.calculate_min_change_targets(6000)
++
++        assert sum(targets.values()) == 6000
++        # Phase A total should be 2000
++        assert targets['10.0.0.1'] + targets['10.0.0.4'] == 2000
++
++    def test_decrease_to_zero(self):
++        """Decreasing to 0 should sleep all miners."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(0)
++
++        assert all(v == 0 for v in targets.values())
++
++    def test_decrease_respects_min_power(self):
++        """Miners should either stay at/above min_power or go to 0 (sleep)."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000, min_power=1000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, min_power=1000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, min_power=1000),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(6000)
++
++        for ip, power in targets.items():
++            assert power == 0 or power >= 1000, f'{ip} has invalid power {power}'
++        assert sum(targets.values()) == 6000
++
++
++class TestMinChangePhaseBalance:
++    """Verify phase balance is maintained."""
++
++    def test_maintains_equal_phase_distribution(self):
++        """Total power should be split equally across phases."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(12000)
++
++        phase_totals = {'A': 0, 'B': 0, 'C': 0}
++        for (ip, actor), power in zip(status.get_phase_miners().items(), [], strict=False):
++            pass
++        # Simpler: just check that all miners get 4000
++        assert targets['10.0.0.1'] == 4000
++        assert targets['10.0.0.2'] == 4000
++        assert targets['10.0.0.3'] == 4000
++
++    def test_phase_balance_with_uneven_current(self):
++        """Even if current state is unbalanced, targets should rebalance."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 4000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 2000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        # Request same total (9000) but with equal phases
++        targets = status.calculate_min_change_targets(9000)
++
++        # Phase A: 4000 → 3000 (decrease)
++        # Phase B: 2000 → 3000 (increase)
++        # Phase C: 3000 → 3000 (unchanged)
++        assert targets['10.0.0.1'] == 3000
++        assert targets['10.0.0.2'] == 3000
++        assert targets['10.0.0.3'] == 3000
++
++    def test_rounding_preserves_total(self):
++        """Rounding across phases should preserve exact total power."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++        # 10001 / 3 = 3333 remainder 2
++        targets = status.calculate_min_change_targets(10001)
++
++        assert sum(targets.values()) == 10001
++
++
++class TestMinChangeMultipleMinersPerPhase:
++    """Tests with multiple miners on each phase."""
++
++    def test_increase_concentrates_changes(self):
++        """Increase should change as few miners as possible per phase."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 3000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, max_power=5000),
++            '10.0.0.5': make_mock_miner('10.0.0.5', 'B', 3000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, max_power=5000),
++            '10.0.0.6': make_mock_miner('10.0.0.6', 'C', 3000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current total: 18000 (6000/phase)
++        # Request: 19500 (6500/phase, +500/phase)
++        targets = status.calculate_min_change_targets(19500)
++
++        assert sum(targets.values()) == 19500
++
++        # Per phase, only ONE miner should change (the one with more headroom picks up 500W)
++        # Both have equal headroom (2000), so the first one sorted by headroom desc gets it
++        for phase_ips in [('10.0.0.1', '10.0.0.4'), ('10.0.0.2', '10.0.0.5'), ('10.0.0.3', '10.0.0.6')]:
++            changed = sum(1 for ip in phase_ips if targets[ip] != 3000)
++            assert changed == 1, f'Expected 1 change in phase, got {changed}: {[(ip, targets[ip]) for ip in phase_ips]}'
++
++    def test_decrease_prefers_single_miner_reduction(self):
++        """Decrease should prefer reducing one miner over sleeping one + reducing another."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 1500, min_power=1000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 4000, min_power=1000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, min_power=1000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, min_power=1000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current: A=5500, B=3000, C=3000 = 11500
++        # Request: 7500 (2500/phase)
++        # Phase A: need to shed 3000. 10.0.0.4 has reducible=3000 (4000-1000) which absorbs it all.
++        # Only 1 miner changes (optimal!) — 10.0.0.4 reduced to 1000.
++        targets = status.calculate_min_change_targets(7500)
++
++        assert sum(targets.values()) == 7500
++        assert targets['10.0.0.1'] == 1500  # unchanged
++        assert targets['10.0.0.4'] == 1000  # reduced by 3000
++
++    def test_decrease_sleeps_when_single_reduction_impossible(self):
++        """When no single miner can absorb the delta, sleep smallest then reduce next."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 2000, min_power=1000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 2000, min_power=1000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 2000, min_power=1000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 2000, min_power=1000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current: A=4000, B=2000, C=2000 = 8000
++        # Request: 3000 (1000/phase)
++        # Phase A: need to shed 3000. Each miner has reducible=1000 (2000-1000). No single one can absorb 3000.
++        # Second pass: sleep smallest (2000W), remaining=1000, next miner reducible=1000 → reduce to 1000.
++        targets = status.calculate_min_change_targets(3000)
++
++        assert sum(targets.values()) == 3000
++        phase_a = targets['10.0.0.1'] + targets['10.0.0.4']
++        assert phase_a == 1000  # One slept (0) + one reduced to 1000
++        # Verify one is sleeping and one is at min_power
++        phase_a_values = sorted([targets['10.0.0.1'], targets['10.0.0.4']])
++        assert phase_a_values == [0, 1000]
++
++
++class TestMinChangeVsProportional:
++    """Compare min_change with proportional to verify fewer changes."""
++
++    def test_min_change_fewer_changes_than_proportional(self):
++        """min_change should touch fewer miners than proportional for small deltas."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000, max_power=5000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 3000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000, max_power=5000),
++            '10.0.0.5': make_mock_miner('10.0.0.5', 'B', 3000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000, max_power=5000),
++            '10.0.0.6': make_mock_miner('10.0.0.6', 'C', 3000, max_power=5000),
++        }
++        status = build_status(miners)
++        current = {ip: 3000 for ip in miners}
++
++        # Small increase: 18000 → 18300
++        min_targets = status.calculate_min_change_targets(18300)
++        prop_targets = status.calculate_miner_power_targets(18300)
++
++        min_changes = sum(1 for ip in miners if min_targets[ip] != current[ip])
++        prop_changes = sum(1 for ip in miners if prop_targets[ip] != current[ip])
++
++        # min_change should change <= 3 miners (one per phase)
++        assert min_changes <= 3
++        # proportional typically changes all 6
++        assert min_changes <= prop_changes
++
++
++# ============================================================
++# Integration tests with Ray SupervisorActor
++# ============================================================
++
++@pytest.fixture
++def min_change_config():
++    """Supervisor config using min_change strategy."""
++    return SupervisorConfig(
++        supervisor_id='sup_min_change',
++        modbus_ip='192.168.1.100',
++        max_total_power=50000,
++        miner_power_strategy='min_change',
++        miners=[
++            MinerConfig(device_id='m1', ip='10.0.0.1', phase='A', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m2', ip='10.0.0.2', phase='B', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m3', ip='10.0.0.3', phase='C', min_power=1000, max_power=5000),
++        ],
++    )
++
++
++@pytest.fixture
++def min_change_config_multi():
++    """Supervisor config with 2 miners per phase using min_change strategy."""
++    return SupervisorConfig(
++        supervisor_id='sup_min_change_multi',
++        modbus_ip='192.168.1.100',
++        max_total_power=60000,
++        miner_power_strategy='min_change',
++        miners=[
++            MinerConfig(device_id='m1', ip='10.0.0.1', phase='A', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m4', ip='10.0.0.4', phase='A', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m2', ip='10.0.0.2', phase='B', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m5', ip='10.0.0.5', phase='B', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m3', ip='10.0.0.3', phase='C', min_power=1000, max_power=5000),
++            MinerConfig(device_id='m6', ip='10.0.0.6', phase='C', min_power=1000, max_power=5000),
++        ],
++    )
++
++
++class TestMinChangeIntegration:
++    """Integration tests running the full SupervisorActor with min_change strategy."""
++
++    @pytest.mark.asyncio
++    async def test_set_power_with_min_change(self, ray_session, min_change_config):
++        """Basic power setting with min_change strategy."""
++        actor = SupervisorActor.remote(config=min_change_config, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        # Set initial power
++        results = await actor.set_power_setpoint.remote(9000)
++        assert all(results.values())
++
++        statuses = await actor.get_all_miner_statuses.remote()
++        assert statuses['10.0.0.1']['status']['power_setpoint'] == 3000
++        assert statuses['10.0.0.2']['status']['power_setpoint'] == 3000
++        assert statuses['10.0.0.3']['status']['power_setpoint'] == 3000
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++    @pytest.mark.asyncio
++    async def test_incremental_increase(self, ray_session, min_change_config):
++        """Small increase should change miners minimally."""
++        actor = SupervisorActor.remote(config=min_change_config, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        # Set initial power
++        await actor.set_power_setpoint.remote(9000)
++
++        # Small increase
++        results = await actor.set_power_setpoint.remote(9300)
++        assert all(results.values())
++
++        statuses = await actor.get_all_miner_statuses.remote()
++        total = sum(s['status']['power_setpoint'] for s in statuses.values())
++        assert total == 9300
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++    @pytest.mark.asyncio
++    async def test_incremental_decrease(self, ray_session, min_change_config):
++        """Small decrease should change miners minimally."""
++        actor = SupervisorActor.remote(config=min_change_config, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        await actor.set_power_setpoint.remote(9000)
++
++        results = await actor.set_power_setpoint.remote(8700)
++        assert all(results.values())
++
++        statuses = await actor.get_all_miner_statuses.remote()
++        total = sum(s['status']['power_setpoint'] for s in statuses.values())
++        assert total == 8700
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++    @pytest.mark.asyncio
++    async def test_set_to_zero_then_restore(self, ray_session, min_change_config):
++        """Setting to 0 then back should work correctly."""
++        actor = SupervisorActor.remote(config=min_change_config, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        await actor.set_power_setpoint.remote(9000)
++        await actor.set_power_setpoint.remote(0)
++
++        statuses = await actor.get_all_miner_statuses.remote()
++        assert all(s['status']['power_setpoint'] == 0 for s in statuses.values())
++
++        # Restore power
++        await actor.set_power_setpoint.remote(9000)
++        statuses = await actor.get_all_miner_statuses.remote()
++        total = sum(s['status']['power_setpoint'] for s in statuses.values())
++        assert total == 9000
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++    @pytest.mark.asyncio
++    async def test_multi_miner_minimal_changes(self, ray_session, min_change_config_multi):
++        """With 2 miners per phase, small changes should touch few miners."""
++        actor = SupervisorActor.remote(config=min_change_config_multi, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        # Set initial power: 18000 (3000 each)
++        await actor.set_power_setpoint.remote(18000)
++        statuses_before = await actor.get_all_miner_statuses.remote()
++
++        # Small increase: 18000 → 18600 (+100 per phase)
++        await actor.set_power_setpoint.remote(18600)
++        statuses_after = await actor.get_all_miner_statuses.remote()
++
++        total = sum(s['status']['power_setpoint'] for s in statuses_after.values())
++        assert total == 18600
++
++        # Count changed miners
++        changed = sum(
++            1 for ip in statuses_after
++            if statuses_after[ip]['status']['power_setpoint'] != statuses_before[ip]['status']['power_setpoint']
++        )
++        # At most 3 miners (one per phase) should change
++        assert changed <= 3, f'Expected ≤3 changes, got {changed}'
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++    @pytest.mark.asyncio
++    async def test_repeated_small_increments(self, ray_session, min_change_config):
++        """Multiple small increments should work correctly."""
++        actor = SupervisorActor.remote(config=min_change_config, miner_factory=MockMinerActor)
++        await actor.initialize.remote()
++
++        await actor.set_power_setpoint.remote(3000)
++
++        for target in range(3300, 9000, 300):
++            results = await actor.set_power_setpoint.remote(target)
++            assert all(results.values()), f'Failed at target {target}'
++
++        statuses = await actor.get_all_miner_statuses.remote()
++        total = sum(s['status']['power_setpoint'] for s in statuses.values())
++        # Last target in the loop is 8700
++        assert total == 8700
++
++        await actor.stop_periodic_maintenance.remote()
++        ray.kill(actor)
++
++
++class TestMinChangeEdgeCases:
++    """Edge cases for min_change strategy."""
++
++    def test_single_miner_per_phase(self):
++        """Single miner per phase — min_change should work same as proportional."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 3000),
++        }
++        status = build_status(miners)
++
++        min_targets = status.calculate_min_change_targets(12000)
++        prop_targets = status.calculate_miner_power_targets(12000)
++
++        # With 1 miner/phase, both strategies produce same result
++        assert min_targets == prop_targets
++
++    def test_all_miners_at_max(self):
++        """When all miners are maxed, requesting same power should change nothing."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 5000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 5000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 5000, max_power=5000),
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(15000)
++
++        assert targets == {'10.0.0.1': 5000, '10.0.0.2': 5000, '10.0.0.3': 5000}
++
++    def test_asymmetric_miners(self):
++        """Miners with different min/max power on the same phase."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 2000, min_power=500, max_power=3000),
++            '10.0.0.4': make_mock_miner('10.0.0.4', 'A', 2000, min_power=1000, max_power=5000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 4000, min_power=1000, max_power=5000),
++            '10.0.0.3': make_mock_miner('10.0.0.3', 'C', 4000, min_power=1000, max_power=5000),
++        }
++        status = build_status(miners)
++        # Current: A=4000, B=4000, C=4000 = 12000
++        # Request 12000 — same total, phases already balanced
++        targets = status.calculate_min_change_targets(12000)
++        assert sum(targets.values()) == 12000
++        # No changes needed
++        assert targets['10.0.0.1'] == 2000
++        assert targets['10.0.0.4'] == 2000
++        assert targets['10.0.0.2'] == 4000
++        assert targets['10.0.0.3'] == 4000
++
++    def test_empty_phase(self):
++        """If a phase has no miners, that phase's allocation is just lost."""
++        miners = {
++            '10.0.0.1': make_mock_miner('10.0.0.1', 'A', 3000),
++            '10.0.0.2': make_mock_miner('10.0.0.2', 'B', 3000),
++            # No phase C miners
++        }
++        status = build_status(miners)
++        targets = status.calculate_min_change_targets(6000)
++        # Phase A gets 2000, Phase B gets 2000, Phase C gets 2000 (no miners to absorb)
++        # A: 3000 → 2000, B: 3000 → 2000
++        assert sum(targets.values()) == 4000  # Only 4000 can be allocated (2 phases)
+-- 
+2.43.0
+
