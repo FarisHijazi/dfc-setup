@@ -1,14 +1,3 @@
-# DFC Stack - Ray Head Orchestrator
-# Includes all sibling repo compose files via the `include` directive.
-#
-# Usage:
-#   docker compose up --build -d
-#   docker compose logs -f
-#   docker compose down -v
-#
-# Set DFC_ROOT in .env to the parent directory containing all repos.
-# Default assumes sibling layout (../control-service, ../discovery-service, etc.)
-
 include:
   - path: ${DFC_ROOT:-..}/discovery-service/docker-compose.yml
   - path: ${DFC_ROOT:-..}/control-service/docker-compose.yml
@@ -21,17 +10,10 @@ services:
   ray-head:
     image: rayproject/ray:2.49.2-py312-cpu
     hostname: ray-head
-    command: >
-      ray start --head --port=6380
-      --dashboard-host=0.0.0.0 --dashboard-port=8265
-      --num-cpus=8 --block
-    ports:
-      - "8265:8265"
-      - "6380:6380"
-      - "10001:10001"
+    command: ray start --head --port=6380 --dashboard-host=0.0.0.0 --dashboard-port=8265 --num-cpus=8 --block
+    ports: ["8265:8265", "6380:6380", "10001:10001"]
     shm_size: 2gb
-    tmpfs:
-      - /tmp/ray
+    tmpfs: [/tmp/ray]
     healthcheck:
       test: ["CMD", "ray", "status"]
       interval: 10s
@@ -39,62 +21,37 @@ services:
       retries: 10
       start_period: 15s
     restart: unless-stopped
-    networks:
-      - dfc
+    networks: [dfc]
 
-  # Override postgres to use TimescaleDB (required by telemetry migrations)
   postgres:
     image: timescale/timescaledb:2.24.0-pg17
-    command:
-      - postgres
-      - -c
-      - shared_preload_libraries=timescaledb
-      - -c
-      - max_connections=200
+    command: [postgres, -c, shared_preload_libraries=timescaledb, -c, max_connections=200]
 
-  # Create the telemetry database (postgres from discovery-service only creates 'control')
   telemetry-db-init:
-    image: postgres:17.6-alpine
-    command: >
-      sh -c "until pg_isready -h postgres -U postgres; do sleep 1; done;
-      psql -h postgres -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname='telemetry'\" | grep -q 1 ||
-      psql -h postgres -U postgres -c 'CREATE DATABASE telemetry'"
-    environment:
-      - PGPASSWORD=postgres
+    image: postgres:17-alpine
+    command: sh -c "until pg_isready -h postgres -U postgres; do sleep 1; done; psql -h postgres -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname='telemetry'\" | grep -q 1 || psql -h postgres -U postgres -c 'CREATE DATABASE telemetry'"
+    environment: { PGPASSWORD: postgres }
     restart: "no"
-    networks:
-      - dfc
+    networks: [dfc]
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
 
-  # Override telemetry-migrations to depend on telemetry-db-init
   telemetry-migrations:
     depends_on:
-      postgres:
-        condition: service_healthy
-      telemetry-db-init:
-        condition: service_completed_successfully
+      postgres: { condition: service_healthy }
+      telemetry-db-init: { condition: service_completed_successfully }
 
-  # Seed the fleet manifest into the database after migrations
   fleet-seeder:
     build: ${DFC_ROOT:-..}/discovery-service
-    command: >
-      uv run python backend/scripts/seed_virtual_fleet.py
-      backend/scripts/fleet-manifest.json
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres/control
+    command: uv run python backend/scripts/seed_virtual_fleet.py backend/scripts/fleet-manifest.json
+    environment: { DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres/control" }
     restart: "no"
-    networks:
-      - dfc
+    networks: [dfc]
     depends_on:
-      migrator:
-        condition: service_completed_successfully
+      migrator: { condition: service_completed_successfully }
 
 networks:
-  dfc:
-    name: dfc
-    driver: bridge
+  dfc: { name: dfc, driver: bridge }
   local_net:
     name: local_net
     driver: bridge
