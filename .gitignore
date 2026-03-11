@@ -1,0 +1,19 @@
+# Cloned service repos (managed separately)
+ray-head/
+control-service/
+discovery-service/
+grid-gateway/
+modbus-server/
+virtual-grid-devices/
+telemetry/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment
+.env
+
+# Redis
+dump.rdb
